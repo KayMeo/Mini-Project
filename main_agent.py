@@ -5,7 +5,7 @@ import os
 from azure_tools import azure_tools 
 
 # Cấu hình API Key
-os.environ["GOOGLE_API_KEY"] = "AIzaSyDpxIeFmi8lpNmLY71kKM_Bu5XlP9I4SzY" 
+os.environ["GOOGLE_API_KEY"] = "OOPS" 
 genai.configure(api_key=os.environ["GOOGLE_API_KEY"])
 
 # Khởi tạo Gemini Model với bộ Tools mới

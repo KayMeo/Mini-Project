@@ -1,6 +1,6 @@
 # azure_tools.py
-from db_azure_connect import SessionLocal, FactInternetSales, DimProduct
-from sqlalchemy import func
+from db_azure_connect import SessionLocal, FactInternetSales, DimProduct, DimProductSubcategory, DimProductCategory
+from sqlalchemy import func, or_
 import chromadb
 
 # Đường dẫn thư mục lưu trữ (Phải khớp với file ingestion)
@@ -31,23 +31,31 @@ def search_product_knowledge(query: str):
     if not results['documents'] or not results['documents'][0]:
         return "Không tìm thấy sản phẩm phù hợp trong tài liệu."
     
-    response_text = "Dựa trên dữ liệu mô tả, tôi tìm thấy:\n"
+    response_text = "Dữ liệu thô từ hệ thống (Vui lòng dịch và hiển thị theo định dạng thẻ):\n"
     for i, doc in enumerate(results['documents'][0]):
         try:
             meta = results['metadatas'][0][i]
             
-            # Lấy thêm Subcategory
-            name = meta.get('name', 'Sản phẩm')
-            price = meta.get('price', 'N/A')
+            # Lấy đầy đủ thông tin để Gemini có "nguyên liệu"
+            name = meta.get('name', 'N/A')
+            price = meta.get('price', '0')
             category = meta.get('category', 'N/A')
-            subcategory = meta.get('subcategory', 'N/A') # <--- LẤY SUB-CATEGORY MỚI
+            subcategory = meta.get('subcategory', 'N/A')
+            stock = meta.get('stock', 0)
+            reorder = meta.get('reorder_point', 0)
             
+            # Đóng gói dữ liệu cực kỳ chi tiết
             response_text += (
-                f"- **{name}** (${price})\n"
-                f"  - Phân loại: {category} > {subcategory}\n" # <--- HIỂN THỊ CẢ HAI
-                f"  - Mô tả RAG: {doc}\n"
+                f"--- ITEM_DATA_START ---\n"
+                f"Product_Name: {name}\n"
+                f"Price: ${price}\n"
+                f"Category_Path: {category} > {subcategory}\n"
+                f"Stock_Status: {stock} (Reorder at: {reorder})\n"
+                f"Original_English_Description: {doc}\n" # Gửi mô tả gốc để AI dịch
+                f"--- ITEM_DATA_END ---\n"
             )
-        except:
+        except Exception as e:
+            print(f"Lỗi đọc metadata: {e}")
             continue
         
     return response_text
@@ -129,33 +137,48 @@ def order_product(product_name: str, quantity: int, user_id: str = "demo_user"):
     )
 
 # --- Tool 4: Lấy danh sách sản phẩm bán chạy nhất ---
-def get_top_sellers(limit: int = 5):
+def get_top_sellers(search_term: str = None, limit: int = 3):
     """
-    Truy vấn Azure SQL để lấy N sản phẩm có số lượng bán (OrderQuantity) cao nhất.
+    Tìm danh sách sản phẩm bán chạy. 
+    search_term: Từ khóa tìm kiếm theo loại sản phẩm (ví dụ: 'Road Bikes', 'Mountain Bikes').
+    limit: Số lượng sản phẩm muốn hiển thị.
     """
     session = SessionLocal()
-    print(f"\n[SQL] Đang truy vấn TOP {limit} sản phẩm bán chạy nhất...")
-    
-    # Truy vấn SQL (Dùng JOIN và GROUP BY)
-    top_products = session.query(
-        DimProduct.EnglishProductName,
-        func.sum(FactInternetSales.OrderQuantity).label('TotalSold')
-    ).join(FactInternetSales, FactInternetSales.ProductKey == DimProduct.ProductKey)\
-     .group_by(DimProduct.EnglishProductName)\
-     .order_by(func.sum(FactInternetSales.OrderQuantity).desc())\
-     .limit(limit)\
-     .all()
-     
-    session.close()
-    
-    if not top_products:
-        return "Không có dữ liệu bán hàng trong database."
+    try:
+        # Khởi tạo Query cơ bản
+        query = session.query(
+            DimProduct.EnglishProductName,
+            func.sum(FactInternetSales.OrderQuantity).label('TotalSold')
+        ).join(FactInternetSales, FactInternetSales.ProductKey == DimProduct.ProductKey)\
+         .join(DimProductSubcategory, DimProduct.ProductSubcategoryKey == DimProductSubcategory.ProductSubcategoryKey)\
+         .join(DimProductCategory, DimProductSubcategory.ProductCategoryKey == DimProductCategory.ProductCategoryKey)
+
+        # Nếu có search_term (do Gemini truyền vào), thực hiện lọc
+        if search_term:
+            query = query.filter(
+                or_(
+                    DimProductCategory.EnglishProductCategoryName.like(f"%{search_term}%"),
+                    DimProductSubcategory.EnglishProductSubcategoryName.like(f"%{search_term}%")
+                )
+            )
+
+        top_results = query.group_by(DimProduct.EnglishProductName)\
+                           .order_by(func.sum(FactInternetSales.OrderQuantity).desc())\
+                           .limit(limit).all()
+
+        if not top_results:
+            return f"Không tìm thấy dữ liệu bán chạy cho từ khóa: '{search_term}'"
+
+        result_text = f"🏆 TOP {len(top_results)} SẢN PHẨM BÁN CHẠY NHẤT ({search_term if search_term else 'Tất cả'}):\n"
+        for name, total in top_results:
+            result_text += f"- **{name}**: Đã bán {int(total)} chiếc 📈\n"
         
-    response_list = []
-    for name, total_sold in top_products:
-        response_list.append(f"- **{name}**: {total_sold} chiếc")
-        
-    return f"🏆 Dưới đây là TOP {len(top_products)} sản phẩm bán chạy nhất:\n" + "\n".join(response_list)
+        return result_text
+
+    except Exception as e:
+        return f"Lỗi truy vấn SQL: {str(e)}"
+    finally:
+        session.close()
 
 # Danh sách tools
 azure_tools = [search_product_knowledge, check_sales_history, order_product, get_top_sellers]
